@@ -18,25 +18,44 @@ import sys
 
 
 def discover_ovs_pmd_tids():
-    """Discover OVS-DPDK PMD thread TIDs via ovs-appctl.
+    """Discover OVS-DPDK PMD thread TIDs.
+
+    Uses ovs-appctl for rich metadata (rxq mapping, numa) when available,
+    falls back to /proc-based scanning when ovs-appctl is not installed.
 
     Returns a list of dicts with tid, core, numa, and rxq info.
     """
-    if not shutil.which("ovs-appctl"):
+    ovs_pid = _get_ovs_pid()
+    if ovs_pid is None:
         return []
 
-    ovs_pid = None
+    if shutil.which("ovs-appctl"):
+        pmds = _discover_ovs_via_appctl(ovs_pid)
+        if pmds:
+            return pmds
+        sys.stderr.write(
+            "ebpf-dpdk: ovs-appctl failed, falling back to /proc scan\n"
+        )
+
+    return _discover_ovs_via_proc(ovs_pid)
+
+
+def _get_ovs_pid():
+    """Find the PID of ovs-vswitchd."""
     try:
         result = subprocess.run(
             ["pgrep", "-x", "ovs-vswitchd"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0 or not result.stdout.strip():
-            return []
-        ovs_pid = int(result.stdout.strip().split("\n")[0])
+            return None
+        return int(result.stdout.strip().split("\n")[0])
     except (subprocess.TimeoutExpired, ValueError, OSError):
-        return []
+        return None
 
+
+def _discover_ovs_via_appctl(ovs_pid):
+    """Discover OVS PMDs using ovs-appctl (rich metadata with rxq mapping)."""
     ovs_dir = "/var/run/openvswitch"
     target = f"--target={ovs_dir}/ovs-vswitchd.{ovs_pid}.ctl"
 
@@ -51,6 +70,61 @@ def discover_ovs_pmd_tids():
         return []
 
     return _parse_pmd_rxq_show(result.stdout, ovs_pid)
+
+
+def _discover_ovs_via_proc(ovs_pid):
+    """Discover OVS PMD threads by scanning /proc/<pid>/task for pmd-c* threads.
+
+    This fallback requires no OVS packages — only procfs access (which is
+    available with --pid=host or chroot osruntime).
+    """
+    task_dir = f"/proc/{ovs_pid}/task"
+    if not os.path.isdir(task_dir):
+        return []
+
+    pmd_re = re.compile(r"^pmd-c(\d+)/")
+    pmds = []
+
+    for tid_str in os.listdir(task_dir):
+        comm_path = os.path.join(task_dir, tid_str, "comm")
+        try:
+            with open(comm_path) as f:
+                comm = f.read().strip()
+            m = pmd_re.match(comm)
+            if m:
+                core_id = int(m.group(1))
+                numa = _get_thread_numa(ovs_pid, int(tid_str))
+                pmds.append({
+                    "tid": int(tid_str),
+                    "core": core_id,
+                    "numa": numa,
+                    "process": "ovs-vswitchd",
+                    "pid": ovs_pid,
+                    "thread_name": comm,
+                })
+        except (OSError, ValueError):
+            continue
+
+    return pmds
+
+
+def _get_thread_numa(pid, tid):
+    """Get NUMA node for a thread from /proc/<pid>/task/<tid>/status."""
+    status_path = f"/proc/{pid}/task/{tid}/status"
+    try:
+        with open(status_path) as f:
+            for line in f:
+                if line.startswith("Cpus_allowed_list:"):
+                    cpu_list = line.split(":", 1)[1].strip()
+                    first_cpu = int(cpu_list.split(",")[0].split("-")[0])
+                    numa_path = f"/sys/devices/system/cpu/cpu{first_cpu}/topology/physical_package_id"
+                    if os.path.exists(numa_path):
+                        with open(numa_path) as nf:
+                            return int(nf.read().strip())
+                    break
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def _parse_pmd_rxq_show(output, ovs_pid):
@@ -194,13 +268,18 @@ def discover_all(target="auto"):
         ovs_pmds = discover_ovs_pmd_tids()
         if ovs_pmds:
             pmds.extend(ovs_pmds)
+            has_rxqs = any(p.get("rxqs") for p in ovs_pmds)
+            method = "ovs-appctl" if has_rxqs else "/proc"
             sys.stderr.write(
-                f"ebpf-dpdk: discovered {len(ovs_pmds)} OVS PMD thread(s)\n"
+                f"ebpf-dpdk: discovered {len(ovs_pmds)} OVS PMD "
+                f"thread(s) via {method}\n"
             )
             for p in ovs_pmds:
+                rxq_info = f" ({len(p.get('rxqs', []))} rxq)" if has_rxqs else ""
+                name_info = f" [{p.get('thread_name', '')}]" if p.get("thread_name") else ""
                 sys.stderr.write(
-                    f"  core {p['core']}: TID {p['tid']} "
-                    f"({len(p.get('rxqs', []))} rxq)\n"
+                    f"  core {p['core']}: TID {p['tid']}"
+                    f"{rxq_info}{name_info}\n"
                 )
 
         if target == "ovs-vswitchd" and not ovs_pmds:

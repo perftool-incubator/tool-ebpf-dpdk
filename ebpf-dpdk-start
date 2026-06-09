@@ -5,14 +5,19 @@
 TOOL_DIR=$(dirname "$0")
 TOOL_OUTPUT_DIR=$(pwd)
 
+exec > "${TOOL_OUTPUT_DIR}/ebpf-dpdk-start-stderrout.txt"
+exec 2>&1
+
 TARGET="auto"
 FREQUENCY=99
 CALL_GRAPH="dwarf"
 PERF_EXTRA_OPTS=""
 RETRY_INTERVAL=10
-RETRY_MAX=30
+RETRY_MAX=18
+MAX_TOTAL_WAIT=180
+BACKGROUND_DISCOVERY="no"
 
-longopts="target:,frequency:,call-graph:,perf-extra-opts:,retry-interval:,retry-max:"
+longopts="target:,frequency:,call-graph:,perf-extra-opts:,retry-interval:,retry-max:,max-total-wait:,background-discovery:"
 opts=$(getopt -q -o "" --longoptions "$longopts" -n "getopt.sh" -- "$@");
 if [ $? -ne 0 ]; then
     printf -- "\tUnrecognized option specified\n\n"
@@ -51,6 +56,16 @@ while true; do
             RETRY_MAX="$1"
             shift
             ;;
+        --max-total-wait)
+            shift;
+            MAX_TOTAL_WAIT="$1"
+            shift
+            ;;
+        --background-discovery)
+            shift;
+            BACKGROUND_DISCOVERY="$1"
+            shift
+            ;;
         --)
             shift;
             break
@@ -62,16 +77,110 @@ while true; do
 done
 
 echo "tool-ebpf-dpdk: start: target=${TARGET} frequency=${FREQUENCY} call-graph=${CALL_GRAPH}"
+echo "tool-ebpf-dpdk: start: background-discovery=${BACKGROUND_DISCOVERY}"
 echo "tool-ebpf-dpdk: start: TOOL_OUTPUT_DIR=${TOOL_OUTPUT_DIR}"
 echo "tool-ebpf-dpdk: start: TOOL_DIR=${TOOL_DIR}"
 
+discovery_daemon() {
+    local tool_dir="$1"
+    local tool_output_dir="$2"
+    local target="$3"
+    local frequency="$4"
+    local call_graph="$5"
+    local perf_extra_opts="$6"
+    local retry_interval="$7"
+    local stop_signal_file="${tool_output_dir}/ebpf-dpdk-stop-signal"
+    local daemon_log="${tool_output_dir}/ebpf-dpdk-daemon-stderrout.txt"
+
+    exec > "${daemon_log}"
+    exec 2>&1
+
+    echo "tool-ebpf-dpdk: daemon: started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "tool-ebpf-dpdk: daemon: target=${target} frequency=${frequency}"
+
+    local tids=""
+    local attempt=0
+
+    while [ -z "${tids}" ]; do
+        if [ -f "${stop_signal_file}" ]; then
+            echo "tool-ebpf-dpdk: daemon: stop signal received, exiting without perf"
+            echo "no-pmd-threads-found" > "${tool_output_dir}/ebpf-dpdk-status.txt"
+            exit 0
+        fi
+
+        tids=$(python3 "${tool_dir}/pmd-discovery.py" --target "${target}" --output tids 2>"${tool_output_dir}/pmd-discovery-stderr.txt")
+
+        if [ -z "${tids}" ]; then
+            attempt=$((attempt + 1))
+            echo "tool-ebpf-dpdk: daemon: no PMD threads found (attempt ${attempt}), retrying in ${retry_interval}s..."
+            sleep "${retry_interval}"
+        fi
+    done
+
+    echo "tool-ebpf-dpdk: daemon: discovered TIDs: ${tids}"
+    echo "${tids}" > "${tool_output_dir}/ebpf-dpdk-tids.txt"
+
+    python3 "${tool_dir}/pmd-discovery.py" --target "${target}" --output json \
+        > "${tool_output_dir}/pmd-discovery.json" 2>/dev/null
+
+    mkdir -p ~/.debug
+
+    local perf_cmd="/usr/bin/perf record"
+    perf_cmd+=" -F ${frequency}"
+    perf_cmd+=" -g"
+    perf_cmd+=" --call-graph ${call_graph}"
+    perf_cmd+=" -t ${tids}"
+    perf_cmd+=" -o ${tool_output_dir}/perf.data"
+    if [ -n "${perf_extra_opts}" ]; then
+        perf_cmd+=" ${perf_extra_opts}"
+    fi
+
+    echo "tool-ebpf-dpdk: daemon: running: ${perf_cmd}"
+    ${perf_cmd} &
+    local perf_pid=$!
+    echo "${perf_pid}" > "${tool_output_dir}/ebpf-dpdk-perf-pid.txt"
+    date +%s%3N > "${tool_output_dir}/ebpf-dpdk-begin-ms.txt"
+    echo "tool-ebpf-dpdk: daemon: perf record started (PID ${perf_pid})"
+    echo "running" > "${tool_output_dir}/ebpf-dpdk-status.txt"
+
+    wait ${perf_pid} 2>/dev/null
+    echo "tool-ebpf-dpdk: daemon: perf record exited"
+}
+
+if [ "${BACKGROUND_DISCOVERY}" == "yes" ]; then
+    echo "tool-ebpf-dpdk: start: using background discovery mode"
+    echo "waiting-for-pmd" > "${TOOL_OUTPUT_DIR}/ebpf-dpdk-status.txt"
+
+    discovery_daemon \
+        "${TOOL_DIR}" \
+        "${TOOL_OUTPUT_DIR}" \
+        "${TARGET}" \
+        "${FREQUENCY}" \
+        "${CALL_GRAPH}" \
+        "${PERF_EXTRA_OPTS}" \
+        "${RETRY_INTERVAL}" &
+    DAEMON_PID=$!
+    echo "${DAEMON_PID}" > "${TOOL_OUTPUT_DIR}/ebpf-dpdk-daemon-pid.txt"
+    echo "tool-ebpf-dpdk: start: background daemon launched (PID ${DAEMON_PID})"
+    echo "tool-ebpf-dpdk: start: exiting foreground immediately"
+    exit 0
+fi
+
+COMPUTED_MAX=$((RETRY_MAX * RETRY_INTERVAL))
+if [ ${COMPUTED_MAX} -gt ${MAX_TOTAL_WAIT} ]; then
+    RETRY_MAX=$((MAX_TOTAL_WAIT / RETRY_INTERVAL))
+    echo "tool-ebpf-dpdk: start: capping retry-max to ${RETRY_MAX} (max-total-wait=${MAX_TOTAL_WAIT}s, interval=${RETRY_INTERVAL}s)"
+fi
+
 TIDS=""
 ATTEMPT=0
-while [ -z "${TIDS}" ] && [ ${ATTEMPT} -lt ${RETRY_MAX} ]; do
+ELAPSED=0
+while [ -z "${TIDS}" ] && [ ${ATTEMPT} -lt ${RETRY_MAX} ] && [ ${ELAPSED} -lt ${MAX_TOTAL_WAIT} ]; do
     TIDS=$(python3 ${TOOL_DIR}/pmd-discovery.py --target "${TARGET}" --output tids 2>"${TOOL_OUTPUT_DIR}/pmd-discovery-stderr.txt")
     if [ -z "${TIDS}" ]; then
         ATTEMPT=$((ATTEMPT + 1))
-        echo "tool-ebpf-dpdk: start: no PMD threads found (attempt ${ATTEMPT}/${RETRY_MAX}), retrying in ${RETRY_INTERVAL}s..."
+        ELAPSED=$((ATTEMPT * RETRY_INTERVAL))
+        echo "tool-ebpf-dpdk: start: no PMD threads found (attempt ${ATTEMPT}/${RETRY_MAX}, elapsed ${ELAPSED}/${MAX_TOTAL_WAIT}s), retrying in ${RETRY_INTERVAL}s..."
         sleep "${RETRY_INTERVAL}"
     fi
 done
@@ -105,5 +214,6 @@ echo "tool-ebpf-dpdk: start: running: ${PERF_CMD}"
 ${PERF_CMD} &
 PERF_PID=$!
 echo "${PERF_PID}" > "${TOOL_OUTPUT_DIR}/ebpf-dpdk-perf-pid.txt"
+date +%s%3N > "${TOOL_OUTPUT_DIR}/ebpf-dpdk-begin-ms.txt"
 echo "tool-ebpf-dpdk: start: perf record started (PID ${PERF_PID})"
 echo "running" > "${TOOL_OUTPUT_DIR}/ebpf-dpdk-status.txt"

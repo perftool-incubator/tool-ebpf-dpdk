@@ -50,22 +50,69 @@ flamegraph reveals:
 
 ## Usage with Crucible
 
-Add `tool-ebpf-dpdk` to the `tool-params` section of your run file:
+Add `tool-ebpf-dpdk` to the `tool-params` section of your run file.
+
+### Single Instance (basic)
 
 ```json
 "tool-params": [
     { "tool": "sysstat" },
     { "tool": "procstat" },
-    { "tool": "ovs", "params": [{ "arg": "interval", "val": "10" }] },
-    { "tool": "dpdk", "params": [
-        { "arg": "interval", "val": "1" },
-        { "arg": "profile", "val": "testpmd" }
-    ]},
     { "tool": "ebpf-dpdk", "params": [
         { "arg": "target", "val": "ovs-vswitchd" },
         { "arg": "frequency", "val": "99" }
     ]}
 ]
+```
+
+### Multi-Instance (recommended for OVS + testpmd topologies)
+
+When profiling both OVS on the compute host and testpmd on a remote server, use separate tool instances with `opt-in` deployment to target each process on its correct host:
+
+```json
+"tool-params": [
+    { "tool": "sysstat" },
+    { "tool": "procstat" },
+    {
+        "tool": "ebpf-dpdk",
+        "id": "ebpf-dpdk-ovs",
+        "deployment": "opt-in",
+        "opt-tag": "has-ovs",
+        "params": [
+            { "arg": "target", "val": "ovs-vswitchd" },
+            { "arg": "frequency", "val": "99" }
+        ]
+    },
+    {
+        "tool": "ebpf-dpdk",
+        "id": "ebpf-dpdk-testpmd",
+        "deployment": "opt-in",
+        "opt-tag": "has-testpmd",
+        "params": [
+            { "arg": "target", "val": "testpmd" },
+            { "arg": "frequency", "val": "99" },
+            { "arg": "background-discovery", "val": "yes" }
+        ]
+    }
+]
+```
+
+Then in your endpoint host definitions, tag each host with the appropriate `tool-opt-in-tags`:
+
+```json
+"endpoints": [{
+    "type": "remotehosts",
+    "config": [
+        {
+            "host": "compute-host.example.com",
+            "tool-opt-in-tags": "has-ovs"
+        },
+        {
+            "host": "server-host.example.com",
+            "tool-opt-in-tags": "has-testpmd"
+        }
+    ]
+}]
 ```
 
 ### Parameters
@@ -77,32 +124,44 @@ Add `tool-ebpf-dpdk` to the `tool-params` section of your run file:
 | `call-graph` | `dwarf` | Call graph unwinding mode: `dwarf`, `fp`, `lbr` |
 | `perf-extra-opts` | (empty) | Additional options passed to `perf record` |
 | `retry-interval` | `10` | Seconds between PMD discovery retries |
-| `retry-max` | `30` | Max discovery retry attempts (total wait: up to 5 min) |
+| `retry-max` | `18` | Max discovery retry attempts |
+| `max-total-wait` | `180` | Max seconds to wait for PMD thread discovery |
+| `background-discovery` | `no` | Enable background daemon mode for late-starting processes (see below) |
+
+### Background Discovery Mode
+
+When `background-discovery=yes`, the start script exits immediately (unblocking the roadblock) and spawns a background daemon that continuously polls for PMD threads. Once threads are found, the daemon launches `perf record`. This is essential for **testpmd** which starts after the benchmark client begins sending traffic.
+
+Use background discovery when:
+- The target process starts **after** the tool start phase (e.g., testpmd)
+- You see `no-pmd-threads-found` errors with the default synchronous mode
+
+Do **not** use background discovery for `ovs-vswitchd` — OVS is always running before the benchmark starts, so synchronous discovery works reliably.
 
 ### Minimal Example
 
-Profile OVS-DPDK with defaults:
+Profile OVS-DPDK with defaults (auto-discovers PMD threads):
 
 ```json
 { "tool": "ebpf-dpdk" }
 ```
-
-This auto-discovers OVS PMD threads and profiles at 99 Hz with DWARF unwinding.
 
 ## Output
 
 After a run, tool-ebpf-dpdk produces these files in the tool data directory:
 
 ```
-tool-data/profiler/remotehosts-1-ebpf-dpdk-1/ebpf-dpdk/
-├── perf.data.xz                              Compressed raw perf data
-├── perf-archive.tar                          Symbol archive (cross-machine analysis)
+tool-data/profiler/remotehosts-1-ebpf-dpdk-ovs-3/ebpf-dpdk-ovs/
+├── perf-script.txt.gz                        Compressed perf script text output
 ├── flamegraph-ovs-vswitchd-full.svg          Full-run flamegraph (interactive SVG)
 ├── flamegraph-ovs-vswitchd-active.svg        Traffic-only flamegraph (idle filtered)
 ├── flamegraph-ovs-vswitchd.folded.xz         Collapsed stacks (speedscope-compatible)
 ├── pmd-discovery.json                        PMD thread metadata
-├── metric-data-0.json.xz                     CDM metrics (top function CPU%)
-├── metric-data-0.csv.xz                      CDM metrics (CSV)
+├── pmd-discovery-stderr.txt                  Discovery log (shows method used)
+├── ebpf-dpdk-begin-ms.txt                    Profiling start timestamp (epoch ms)
+├── ebpf-dpdk-end-ms.txt                      Profiling end timestamp (epoch ms)
+├── metric-data-0.json.xz                     CDM metric descriptors
+├── metric-data-0.csv.xz                      CDM metric samples
 └── post-process-data.json                    Rickshaw manifest
 ```
 
@@ -147,13 +206,24 @@ Load in [FlameScope](https://github.com/Netflix/flamescope) for subsecond-offset
 
 ## PMD Thread Discovery
 
-The tool auto-discovers PMD thread TIDs using two methods:
+The tool uses a two-tier discovery mechanism in `pmd-discovery.py`:
 
-**OVS-DPDK** (primary): parses `ovs-appctl dpif-netdev/pmd-rxq-show` for PMD thread IDs, core assignments, and rx queue mappings.
+### OVS-DPDK (two-tier)
 
-**Generic DPDK** (fallback): scans `/proc/<pid>/task/*/comm` for threads named `lcore-worker-*` after finding the DPDK process via `pgrep`.
+1. **Primary**: `ovs-appctl dpif-netdev/pmd-rxq-show` — provides rich metadata (rxq mapping, numa node, core assignments). Requires `ovs-appctl` to be installed.
+2. **Fallback**: `/proc/<pid>/task/*/comm` scan for `pmd-c*` threads — works inside containers without the `openvswitch` package. Derives NUMA node from sysfs topology.
 
-Discovery retries every 10 seconds (up to 5 minutes) to handle the timing gap between tool-start and testpmd/OVS startup. If no PMD threads are found, the tool exits gracefully.
+The fallback is critical because the `ebpf-dpdk` container image does not include `openvswitch` (and shouldn't — it would add 50MB+ of unnecessary dependencies). Since the container runs with `--pid=host` access, `/proc` scanning works reliably.
+
+### Generic DPDK (testpmd, l3fwd, etc.)
+
+Scans `/proc/<pid>/task/*/comm` for threads named `lcore-worker-*` after finding the DPDK process via `pgrep -f <process_name>`.
+
+### Discovery Retries
+
+Discovery retries every 10 seconds (up to `max-total-wait`, default 180s). If no PMD threads are found:
+- **Synchronous mode**: the tool logs a warning and exits gracefully
+- **Background-discovery mode**: the daemon keeps polling until the stop signal is received
 
 ## Supported Scenarios
 
@@ -173,37 +243,118 @@ Discovery retries every 10 seconds (up to 5 minutes) to handle the timing gap be
 Collection (profiler engine)         Post-Processing (controller)
 ────────────────────────────         ────────────────────────────
 pmd-discovery.py                     ebpf-dpdk-post-process
-  ├─ ovs-appctl pmd-rxq-show          ├─ xz -d perf.data.xz
-  └─ /proc scan                        ├─ perf script --no-inline
-       │                                ├─ stackcollapse-perf.pl
-       ▼                                │     ├─→ flamegraph.pl → SVG
-perf record -F 99 -g -t TIDs          │     └─→ .folded.xz (speedscope)
-  (runs entire iteration)               ├─ traffic window detection
-       │                                │     └─→ active.svg
-       ▼                                ├─ top function extraction
-ebpf-dpdk-stop                         │     └─→ CDM metrics
-  ├─ kill -SIGINT                       └─ post-process-data.json
-  ├─ perf archive
-  └─ xz --threads=0 perf.data
+  ├─ ovs-appctl (if available)         ├─ decompress perf-script.txt.gz
+  └─ /proc scan (fallback)             ├─ stackcollapse-perf.pl (or builtin)
+       │                                │     ├─→ flamegraph.pl → SVG
+       ▼                                │     └─→ .folded.xz (speedscope)
+perf record -F 99 -g -t TIDs          ├─ traffic window detection
+  (runs entire iteration)               │     └─→ active.svg
+       │                                ├─ top function extraction
+       ▼                                │     └─→ CDM metrics (per-instance source)
+ebpf-dpdk-stop                         └─ post-process-data.json
+  ├─ kill -SIGINT perf
+  ├─ perf script → perf-script.txt
+  └─ gzip perf-script.txt
 ```
+
+Key design decisions:
+- `perf script` runs during the stop phase (engine container has `perf`) rather than during post-processing (controller does not have `perf`)
+- Compression uses `gzip` for speed (120s time budget for stop phase)
+- Each tool instance emits CDM metrics under its own source name (e.g., `ebpf-dpdk-ovs`, `ebpf-dpdk-testpmd`)
 
 ## Dependencies
 
-### Runtime (engine container image)
+### Runtime (engine container image — defined in workshop.json)
 
 | Package | Source | Purpose |
 |---------|--------|---------|
-| `perf` | Distro | CPU profiling |
-| `python3` | Distro | PMD discovery, post-processing |
-| `xz` | Distro | Compression |
-| FlameGraph toolkit | [github.com/brendangregg/FlameGraph](https://github.com/brendangregg/FlameGraph) | SVG generation |
+| `perf` | Distro | CPU profiling and `perf script` during stop |
+| `python3` | Distro | PMD discovery |
+| `xz` | Distro | Compression utilities |
+| FlameGraph toolkit | [github.com/brendangregg/FlameGraph](https://github.com/brendangregg/FlameGraph) | SVG generation (optional, builtin fallback exists) |
 
 ### Post-processing (controller container)
 
 | Dependency | Source | Purpose |
 |------------|--------|---------|
 | `toolbox.metrics` | `subprojects/core/toolbox` | CDM metric emission |
-| `perf` | Distro (in controller image) | `perf script` for stack extraction |
+| `gzip` | Base image | Decompression of `perf-script.txt.gz` |
+
+Note: `perf` is **not** required in the controller. The `perf script` conversion happens during the stop phase inside the engine container where `perf` is installed. The controller only reads the pre-generated text output.
+
+## Example Results
+
+From a trafficgen benchmark run with OVS-DPDK (compute host) and testpmd (server host):
+
+### CDM Metric Query
+
+```bash
+# Query OVS PMD top functions
+$ crucible get metric --run <run-id> --source ebpf-dpdk-ovs --type top1-function-pct --breakout function
+
+                                                        source             type                function   value
+ ebpf-dpdk-ovs top1-function-pct rte_vhost_dequeue_burst      19.92
+
+# Query all top 5 functions
+$ crucible get metric --run <run-id> --source ebpf-dpdk-ovs --type top2-function-pct --breakout function
+$ crucible get metric --run <run-id> --source ebpf-dpdk-ovs --type top3-function-pct --breakout function
+...
+```
+
+### Sample Output (OVS-DPDK, 10 PMD threads, 60s run)
+
+```
+source: ebpf-dpdk-ovs
+  perf-samples:      25,231
+  top1-function-pct: rte_vhost_dequeue_burst    19.92%
+  top2-function-pct: dp_netdev_process_rxq_port 15.74%
+  top3-function-pct: rxq_cq_process_v           13.44%
+  top4-function-pct: [unknown]                   6.42%
+  top5-function-pct: pmd_thread_main             5.17%
+
+source: ebpf-dpdk-testpmd
+  perf-samples:      2
+  top1-function-pct: exit_to_user_mode_loop     50.00%
+  top2-function-pct: _raw_spin_unlock_irq       50.00%
+```
+
+### PMD Discovery Log
+
+```
+ebpf-dpdk: discovered 10 OVS PMD thread(s) via /proc
+  core 10: TID 2066 [pmd-c10/id:11]
+  core 11: TID 2071 [pmd-c11/id:16]
+  core 12: TID 2067 [pmd-c12/id:12]
+  core 13: TID 2064 [pmd-c13/id:9]
+  core 14: TID 2072 [pmd-c14/id:17]
+  core 15: TID 2073 [pmd-c15/id:18]
+  core 16: TID 2069 [pmd-c16/id:14]
+  core 17: TID 2065 [pmd-c17/id:10]
+  core 18: TID 2070 [pmd-c18/id:15]
+  core 19: TID 2068 [pmd-c19/id:13]
+```
+
+### Available Metric Types
+
+| Source | Type | Class | Description |
+|--------|------|-------|-------------|
+| `ebpf-dpdk-<id>` | `top-function-pct` | utilization | Highest CPU% function |
+| `ebpf-dpdk-<id>` | `top1-function-pct` ... `top5-function-pct` | utilization | Top 5 functions by CPU% |
+| `ebpf-dpdk-<id>` | `perf-samples` | count | Total perf samples collected |
+| `ebpf-dpdk-<id>` | `perf-samples-active` | count | Samples during active traffic window |
+
+The `<id>` suffix matches the tool instance ID from the run file (e.g., `ovs`, `testpmd`).
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `no-pmd-threads-found` | Target process not running at tool start time | Use `background-discovery=yes` for late-starting processes |
+| Roadblock timeout at `start-tools-end` | PMD discovery taking too long | Reduce `max-total-wait` or switch to `background-discovery` |
+| Stuck at `stop-tools-end` | Large perf.data + slow compression | Fixed: stop script has 120s time budget with gzip |
+| Zero-value CDM metrics | Missing epoch timestamps in metric data | Fixed: begin/end timestamps recorded during collection |
+| `perf: command not found` during post-process | perf not in controller image | Fixed: `perf script` now runs during stop phase (engine has perf) |
+| OVS PMDs not discovered in container | `ovs-appctl` not installed in engine image | Fixed: `/proc` fallback doesn't require OVS packages |
 
 ## Documentation
 

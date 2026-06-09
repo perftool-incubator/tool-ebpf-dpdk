@@ -4,18 +4,73 @@
 
 TOOL_OUTPUT_DIR=$(pwd)
 
-echo "tool-ebpf-dpdk: stop: TOOL_OUTPUT_DIR=${TOOL_OUTPUT_DIR}"
+exec > "${TOOL_OUTPUT_DIR}/ebpf-dpdk-stop-stderrout.txt"
+exec 2>&1
 
+MAX_STOP_TIME=120
+STOP_START_TIME=$(date +%s)
+
+time_remaining() {
+    local elapsed=$(( $(date +%s) - STOP_START_TIME ))
+    local remaining=$(( MAX_STOP_TIME - elapsed ))
+    echo ${remaining}
+}
+
+echo "tool-ebpf-dpdk: stop: TOOL_OUTPUT_DIR=${TOOL_OUTPUT_DIR}"
+echo "tool-ebpf-dpdk: stop: max stop time=${MAX_STOP_TIME}s"
+
+STOP_SIGNAL_FILE="${TOOL_OUTPUT_DIR}/ebpf-dpdk-stop-signal"
 STATUS_FILE="${TOOL_OUTPUT_DIR}/ebpf-dpdk-status.txt"
+PID_FILE="${TOOL_OUTPUT_DIR}/ebpf-dpdk-perf-pid.txt"
+DAEMON_PID_FILE="${TOOL_OUTPUT_DIR}/ebpf-dpdk-daemon-pid.txt"
+
+touch "${STOP_SIGNAL_FILE}"
+echo "tool-ebpf-dpdk: stop: stop signal written"
+
+sleep 2
+
 if [ -f "${STATUS_FILE}" ]; then
     status=$(cat "${STATUS_FILE}")
-    if [ "${status}" == "no-pmd-threads-found" ]; then
-        echo "tool-ebpf-dpdk: stop: no PMD threads were found during start, nothing to stop"
-        exit 0
-    fi
+    echo "tool-ebpf-dpdk: stop: current status=${status}"
+else
+    status=""
+    echo "tool-ebpf-dpdk: stop: no status file found"
 fi
 
-PID_FILE="${TOOL_OUTPUT_DIR}/ebpf-dpdk-perf-pid.txt"
+if [ -f "${DAEMON_PID_FILE}" ]; then
+    DAEMON_PID=$(cat "${DAEMON_PID_FILE}")
+    if kill -0 "${DAEMON_PID}" 2>/dev/null; then
+        if [ "${status}" == "waiting-for-pmd" ]; then
+            echo "tool-ebpf-dpdk: stop: daemon still discovering, killing PID ${DAEMON_PID}"
+            kill "${DAEMON_PID}" 2>/dev/null
+            wait "${DAEMON_PID}" 2>/dev/null
+            echo "no-pmd-threads-found" > "${STATUS_FILE}"
+        else
+            echo "tool-ebpf-dpdk: stop: daemon PID ${DAEMON_PID} still alive, waiting for it to finish"
+            for i in $(seq 1 5); do
+                if ! kill -0 "${DAEMON_PID}" 2>/dev/null; then
+                    break
+                fi
+                sleep 1
+            done
+            if kill -0 "${DAEMON_PID}" 2>/dev/null; then
+                echo "tool-ebpf-dpdk: stop: force killing daemon PID ${DAEMON_PID}"
+                kill -9 "${DAEMON_PID}" 2>/dev/null
+            fi
+        fi
+    else
+        echo "tool-ebpf-dpdk: stop: daemon PID ${DAEMON_PID} already exited"
+    fi
+    rm -f "${DAEMON_PID_FILE}"
+fi
+
+status=$(cat "${STATUS_FILE}" 2>/dev/null)
+
+if [ "${status}" == "no-pmd-threads-found" ] || [ "${status}" == "waiting-for-pmd" ]; then
+    echo "tool-ebpf-dpdk: stop: no PMD threads were found during start, nothing to stop"
+    echo "stopped" > "${STATUS_FILE}"
+    exit 0
+fi
 
 if [ -f "${PID_FILE}" ]; then
     PERF_PID=$(cat "${PID_FILE}")
@@ -28,6 +83,12 @@ if [ -f "${PID_FILE}" ]; then
         for i in $(seq 1 30); do
             if ! kill -0 "${PERF_PID}" 2>/dev/null; then
                 echo "tool-ebpf-dpdk: stop: perf exited after ${i}s"
+                break
+            fi
+            if [ $(time_remaining) -le 5 ]; then
+                echo "tool-ebpf-dpdk: stop: approaching time limit, force killing perf"
+                kill -9 "${PERF_PID}" 2>/dev/null
+                sleep 1
                 break
             fi
             sleep 1
@@ -46,20 +107,49 @@ else
     echo "tool-ebpf-dpdk: stop: PID file not found at ${PID_FILE}"
 fi
 
+date +%s%3N > "${TOOL_OUTPUT_DIR}/ebpf-dpdk-end-ms.txt"
+
 echo "tool-ebpf-dpdk: stop: directory contents after stop:"
 ls -la "${TOOL_OUTPUT_DIR}/" 2>&1
+
+PERF_SCRIPT_FILE="${TOOL_OUTPUT_DIR}/perf-script.txt"
 
 if [ -f "${TOOL_OUTPUT_DIR}/perf.data" ]; then
     PERF_DATA_SIZE=$(stat --format=%s "${TOOL_OUTPUT_DIR}/perf.data" 2>/dev/null || echo 0)
     echo "tool-ebpf-dpdk: stop: perf.data size: ${PERF_DATA_SIZE} bytes"
 
-    if [ "${PERF_DATA_SIZE}" -gt 0 ]; then
-        echo "tool-ebpf-dpdk: stop: running perf archive"
-        cd "${TOOL_OUTPUT_DIR}" && /usr/bin/perf archive perf.data 2>&1 || true
-
-        echo "tool-ebpf-dpdk: stop: compressing perf.data"
-        xz --threads=0 "${TOOL_OUTPUT_DIR}/perf.data"
-        echo "tool-ebpf-dpdk: stop: compression complete"
+    if [ "${PERF_DATA_SIZE}" -gt 0 ] && [ $(time_remaining) -gt 15 ]; then
+        echo "tool-ebpf-dpdk: stop: running perf script to generate text output"
+        perf script --no-inline -i "${TOOL_OUTPUT_DIR}/perf.data" > "${PERF_SCRIPT_FILE}" 2>/dev/null
+        PERF_SCRIPT_RC=$?
+        SCRIPT_SIZE=$(stat --format=%s "${PERF_SCRIPT_FILE}" 2>/dev/null || echo 0)
+        if [ ${PERF_SCRIPT_RC} -eq 0 ] && [ "${SCRIPT_SIZE}" -gt 0 ]; then
+            echo "tool-ebpf-dpdk: stop: perf script output: ${SCRIPT_SIZE} bytes"
+            rm -f "${TOOL_OUTPUT_DIR}/perf.data"
+            echo "tool-ebpf-dpdk: stop: removed raw perf.data (perf-script.txt available)"
+            if [ $(time_remaining) -gt 10 ]; then
+                echo "tool-ebpf-dpdk: stop: compressing perf-script.txt with gzip"
+                gzip "${PERF_SCRIPT_FILE}"
+                echo "tool-ebpf-dpdk: stop: compression complete"
+            fi
+        else
+            echo "tool-ebpf-dpdk: stop: perf script failed (rc=${PERF_SCRIPT_RC}), keeping perf.data"
+            rm -f "${PERF_SCRIPT_FILE}"
+            if [ $(time_remaining) -gt 10 ]; then
+                echo "tool-ebpf-dpdk: stop: compressing perf.data with gzip"
+                gzip "${TOOL_OUTPUT_DIR}/perf.data"
+                echo "tool-ebpf-dpdk: stop: compression complete"
+            fi
+        fi
+    elif [ "${PERF_DATA_SIZE}" -gt 0 ]; then
+        echo "tool-ebpf-dpdk: stop: WARNING: insufficient time for perf script ($(time_remaining)s remaining)"
+        if [ $(time_remaining) -gt 10 ]; then
+            echo "tool-ebpf-dpdk: stop: compressing perf.data with gzip"
+            gzip "${TOOL_OUTPUT_DIR}/perf.data"
+            echo "tool-ebpf-dpdk: stop: compression complete"
+        else
+            echo "tool-ebpf-dpdk: stop: WARNING: insufficient time for compression, leaving perf.data uncompressed"
+        fi
     else
         echo "tool-ebpf-dpdk: stop: WARNING: perf.data is empty (0 bytes)"
     fi
@@ -70,3 +160,4 @@ fi
 echo "tool-ebpf-dpdk: stop: final directory contents:"
 ls -la "${TOOL_OUTPUT_DIR}/" 2>&1
 echo "stopped" > "${STATUS_FILE}"
+echo "tool-ebpf-dpdk: stop: completed in $(( $(date +%s) - STOP_START_TIME ))s"
