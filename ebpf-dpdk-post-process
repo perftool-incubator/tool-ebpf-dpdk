@@ -16,7 +16,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 TOOLBOX_HOME = os.environ.get("TOOLBOX_HOME")
@@ -30,41 +29,107 @@ STACKCOLLAPSE = os.path.join(FLAMEGRAPH_DIR, "stackcollapse-perf.pl")
 FLAMEGRAPH_PL = os.path.join(FLAMEGRAPH_DIR, "flamegraph.pl")
 
 
-def run_perf_script(perf_data_xz, output_dir):
-    """Decompress perf.data.xz and run perf script to get stack traces.
+def find_perf_script(output_dir):
+    """Find pre-generated perf-script.txt (produced during stop phase).
 
-    Optimizations applied:
-    - Multi-threaded xz decompression (--threads=0)
-    - --no-inline avoids expensive inline symbol resolution (5-10x faster)
-    - Immediate cleanup of decompressed perf.data to save disk
+    The stop script runs 'perf script' inside the engine container where
+    perf is installed, avoiding the need for perf in the controller.
+    """
+    candidates = [
+        (os.path.join(output_dir, "perf-script.txt.gz"), "gz"),
+        (os.path.join(output_dir, "perf-script.txt.xz"), "xz"),
+        (os.path.join(output_dir, "perf-script.txt"), "raw"),
+    ]
+    for path, fmt in candidates:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path, fmt
+    return None, None
+
+
+def find_perf_data(output_dir):
+    """Find compressed perf.data in any supported format (.xz, .gz, or uncompressed)."""
+    candidates = [
+        (os.path.join(output_dir, "perf.data.xz"), "xz"),
+        (os.path.join(output_dir, "perf.data.gz"), "gz"),
+        (os.path.join(output_dir, "perf.data"), "raw"),
+    ]
+    for path, fmt in candidates:
+        if os.path.exists(path):
+            return path, fmt
+    return None, None
+
+
+def decompress_perf_script(script_path, output_dir, fmt):
+    """Decompress pre-generated perf-script.txt and return the output path."""
+    perf_script_out = os.path.join(output_dir, "perf-script.txt")
+
+    if fmt == "raw":
+        sys.stderr.write("ebpf-dpdk: post-process: using pre-generated perf-script.txt\n")
+        size = os.path.getsize(script_path)
+        sys.stderr.write(
+            f"ebpf-dpdk: post-process: perf script output: {size} bytes\n"
+        )
+        return script_path
+    elif fmt == "gz":
+        sys.stderr.write("ebpf-dpdk: post-process: decompressing perf-script.txt.gz\n")
+        import gzip as gzip_mod
+        with gzip_mod.open(script_path, "rt") as gz_f:
+            with open(perf_script_out, "w") as out_f:
+                for chunk in iter(lambda: gz_f.read(8192), ""):
+                    out_f.write(chunk)
+    else:
+        sys.stderr.write("ebpf-dpdk: post-process: decompressing perf-script.txt.xz\n")
+        with lzma.open(script_path, "rt") as xz_f:
+            with open(perf_script_out, "w") as out_f:
+                for chunk in iter(lambda: xz_f.read(8192), ""):
+                    out_f.write(chunk)
+
+    size = os.path.getsize(perf_script_out)
+    sys.stderr.write(
+        f"ebpf-dpdk: post-process: perf script output: {size} bytes\n"
+    )
+    return perf_script_out
+
+
+def run_perf_script(perf_data_compressed, output_dir, fmt="xz"):
+    """Decompress perf.data and run perf script to get stack traces.
+
+    This is the fallback path used only when the stop phase did not
+    produce perf-script.txt (e.g., ran out of time).
     """
     perf_data = os.path.join(output_dir, "perf.data")
     perf_script_out = os.path.join(output_dir, "perf-script.txt")
 
-    if not os.path.exists(perf_data_xz):
+    if not os.path.exists(perf_data_compressed):
         sys.stderr.write(
-            f"ebpf-dpdk: post-process: {perf_data_xz} not found, skipping\n"
+            f"ebpf-dpdk: post-process: {perf_data_compressed} not found, skipping\n"
         )
         return None
 
-    t0 = time.monotonic()
-    sys.stderr.write("ebpf-dpdk: post-process: decompressing perf.data.xz\n")
-    result = subprocess.run(
-        ["xz", "-dk", "--threads=0", perf_data_xz],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        sys.stderr.write(
-            f"ebpf-dpdk: post-process: xz decompress failed: {result.stderr}\n"
+    if fmt == "raw":
+        sys.stderr.write("ebpf-dpdk: post-process: using uncompressed perf.data\n")
+    elif fmt == "gz":
+        sys.stderr.write("ebpf-dpdk: post-process: decompressing perf.data.gz\n")
+        result = subprocess.run(
+            ["gzip", "-dk", perf_data_compressed],
+            capture_output=True, text=True
         )
-        return None
-
-    t1 = time.monotonic()
-    perf_size = os.path.getsize(perf_data)
-    sys.stderr.write(
-        f"ebpf-dpdk: post-process: decompressed {perf_size} bytes "
-        f"in {t1-t0:.1f}s\n"
-    )
+        if result.returncode != 0:
+            sys.stderr.write(
+                f"ebpf-dpdk: post-process: gzip decompress failed: {result.stderr}\n"
+            )
+            return None
+    else:
+        sys.stderr.write("ebpf-dpdk: post-process: decompressing perf.data.xz\n")
+        result = subprocess.run(
+            ["xz", "-dk", perf_data_compressed],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            sys.stderr.write(
+                f"ebpf-dpdk: post-process: xz decompress failed: {result.stderr}\n"
+            )
+            return None
 
     sys.stderr.write("ebpf-dpdk: post-process: running perf script\n")
     with open(perf_script_out, "w") as f:
@@ -73,7 +138,7 @@ def run_perf_script(perf_data_xz, output_dir):
             stdout=f, stderr=subprocess.PIPE, text=True
         )
 
-    if os.path.exists(perf_data):
+    if fmt != "raw" and os.path.exists(perf_data):
         os.unlink(perf_data)
 
     if result.returncode != 0:
@@ -82,11 +147,9 @@ def run_perf_script(perf_data_xz, output_dir):
         )
         return None
 
-    t2 = time.monotonic()
     size = os.path.getsize(perf_script_out)
     sys.stderr.write(
-        f"ebpf-dpdk: post-process: perf script output: {size} bytes "
-        f"in {t2-t1:.1f}s\n"
+        f"ebpf-dpdk: post-process: perf script output: {size} bytes\n"
     )
     return perf_script_out
 
@@ -102,7 +165,6 @@ def collapse_stacks(perf_script_file, output_dir):
         )
         return builtin_collapse(perf_script_file, folded_file)
 
-    t0 = time.monotonic()
     with open(folded_file, "w") as f:
         result = subprocess.run(
             ["perl", STACKCOLLAPSE, "--tid", perf_script_file],
@@ -114,16 +176,11 @@ def collapse_stacks(perf_script_file, output_dir):
         )
         return None
 
-    t1 = time.monotonic()
-    sys.stderr.write(
-        f"ebpf-dpdk: post-process: stackcollapse completed in {t1-t0:.1f}s\n"
-    )
     return folded_file
 
 
 def builtin_collapse(perf_script_file, folded_file):
     """Minimal built-in stack collapser as fallback if FlameGraph not available."""
-    t0 = time.monotonic()
     stacks = collections.Counter()
     current_stack = []
     current_comm = ""
@@ -156,76 +213,7 @@ def builtin_collapse(perf_script_file, folded_file):
         for stack, count in stacks.most_common():
             f.write(f"{stack} {count}\n")
 
-    t1 = time.monotonic()
-    sys.stderr.write(
-        f"ebpf-dpdk: post-process: builtin collapse completed in {t1-t0:.1f}s "
-        f"({len(stacks)} unique stacks)\n"
-    )
     return folded_file
-
-
-def builtin_collapse_with_time_split(perf_script_file, folded_full_file,
-                                      folded_active_file, start_ts, end_ts):
-    """Single-pass stack collapser that produces both full and active folded files.
-
-    Avoids the cost of parsing perf script output twice by splitting stacks
-    into full and active buckets in a single pass.
-    """
-    t0 = time.monotonic()
-    stacks_full = collections.Counter()
-    stacks_active = collections.Counter()
-    current_stack = []
-    current_comm = ""
-    current_ts = None
-    ts_re = re.compile(r'\s+(\d+\.\d+):\s+')
-
-    with open(perf_script_file) as f:
-        for line in f:
-            line = line.rstrip()
-            if not line:
-                if current_stack and current_comm:
-                    stack_str = current_comm + ";" + ";".join(reversed(current_stack))
-                    stacks_full[stack_str] += 1
-                    if current_ts and start_ts <= current_ts <= end_ts:
-                        stacks_active[stack_str] += 1
-                current_stack = []
-                current_comm = ""
-                current_ts = None
-                continue
-
-            if line[0] != ' ' and line[0] != '\t':
-                parts = line.split()
-                if parts:
-                    current_comm = parts[0]
-                m = ts_re.search(line)
-                if m:
-                    current_ts = float(m.group(1))
-            else:
-                frame_match = re.match(r'\s+\S+\s+(.+?)(?:\s+\(|$)', line)
-                if frame_match:
-                    func = frame_match.group(1).strip()
-                    if func.startswith("("):
-                        continue
-                    func = func.split("+")[0]
-                    current_stack.append(func)
-
-    with open(folded_full_file, "w") as f:
-        for stack, count in stacks_full.most_common():
-            f.write(f"{stack} {count}\n")
-
-    with open(folded_active_file, "w") as f:
-        for stack, count in stacks_active.most_common():
-            f.write(f"{stack} {count}\n")
-
-    t1 = time.monotonic()
-    total_full = sum(stacks_full.values())
-    total_active = sum(stacks_active.values())
-    sys.stderr.write(
-        f"ebpf-dpdk: post-process: single-pass collapse completed in {t1-t0:.1f}s "
-        f"(full={total_full}, active={total_active}, "
-        f"{len(stacks_full)} unique stacks)\n"
-    )
-    return total_full, total_active
 
 
 def generate_flamegraph(folded_file, svg_file, title="DPDK PMD Flamegraph"):
@@ -405,44 +393,120 @@ def extract_top_functions(folded_file, top_n=10):
     return results
 
 
+def read_epoch_ms(filepath):
+    """Read epoch millisecond timestamp from file."""
+    try:
+        with open(filepath) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def get_collection_timestamps(output_dir):
+    """Get the begin/end epoch-ms timestamps for the profiling window.
+
+    Reads timestamps written by ebpf-dpdk-start and ebpf-dpdk-stop.
+    Falls back to file modification times if timestamp files are missing.
+    """
+    begin_file = os.path.join(output_dir, "ebpf-dpdk-begin-ms.txt")
+    end_file = os.path.join(output_dir, "ebpf-dpdk-end-ms.txt")
+
+    begin_ms = read_epoch_ms(begin_file)
+    end_ms = read_epoch_ms(end_file)
+
+    if begin_ms is None:
+        for candidate in ["ebpf-dpdk-tids.txt", "pmd-discovery.json",
+                          "ebpf-dpdk-start-stderrout.txt"]:
+            path = os.path.join(output_dir, candidate)
+            if os.path.exists(path):
+                begin_ms = int(os.path.getmtime(path) * 1000)
+                break
+
+    if end_ms is None:
+        for candidate in ["ebpf-dpdk-stop-signal", "ebpf-dpdk-stop-stderrout.txt"]:
+            path = os.path.join(output_dir, candidate)
+            if os.path.exists(path):
+                end_ms = int(os.path.getmtime(path) * 1000)
+                break
+
+    if begin_ms is None:
+        begin_ms = 1
+    if end_ms is None:
+        end_ms = begin_ms + 1
+
+    return begin_ms, end_ms
+
+
+def get_tool_source_name(output_dir):
+    """Get the tool instance name to use as metric source.
+
+    Reads tool_name from engine-env.txt (e.g., 'ebpf-dpdk-ovs',
+    'ebpf-dpdk-testpmd'). Falls back to 'ebpf-dpdk' if not found.
+    """
+    env_file = os.path.join(output_dir, "engine-env.txt")
+    if os.path.exists(env_file):
+        try:
+            with open(env_file) as f:
+                for line in f:
+                    if line.startswith("tool_name="):
+                        return line.split("=", 1)[1].strip()
+        except OSError:
+            pass
+    return "ebpf-dpdk"
+
+
 def emit_cdm_metrics(output_dir, top_functions, total_samples,
                      active_samples=None):
     """Emit CDM metrics for top function percentages and sample counts."""
     file_id = "0"
+    begin_ms, end_ms = get_collection_timestamps(output_dir)
+    source_name = get_tool_source_name(output_dir)
+
+    sys.stderr.write(
+        f"ebpf-dpdk: post-process: metric source: {source_name}\n"
+    )
+    sys.stderr.write(
+        f"ebpf-dpdk: post-process: metric timestamps: "
+        f"begin={begin_ms} end={end_ms} duration={end_ms - begin_ms}ms\n"
+    )
 
     if top_functions:
         top_func, top_pct = top_functions[0]
         desc = {
-            "source": "ebpf-dpdk",
+            "source": source_name,
             "class": "utilization",
             "type": "top-function-pct",
         }
         names = {"function": top_func}
-        log_sample(file_id, desc, names, {"end": 0, "value": top_pct})
+        log_sample(file_id, desc, names,
+                   {"begin": begin_ms, "end": end_ms, "value": top_pct})
 
     for i, (func, pct) in enumerate(top_functions[:5]):
         desc = {
-            "source": "ebpf-dpdk",
+            "source": source_name,
             "class": "utilization",
             "type": f"top{i+1}-function-pct",
         }
         names = {"function": func}
-        log_sample(file_id, desc, names, {"end": 0, "value": pct})
+        log_sample(file_id, desc, names,
+                   {"begin": begin_ms, "end": end_ms, "value": pct})
 
     desc = {
-        "source": "ebpf-dpdk",
+        "source": source_name,
         "class": "count",
         "type": "perf-samples",
     }
-    log_sample(file_id, desc, {}, {"end": 0, "value": total_samples})
+    log_sample(file_id, desc, {},
+               {"begin": begin_ms, "end": end_ms, "value": total_samples})
 
     if active_samples is not None:
         desc = {
-            "source": "ebpf-dpdk",
+            "source": source_name,
             "class": "count",
             "type": "perf-samples-active",
         }
-        log_sample(file_id, desc, {}, {"end": 0, "value": active_samples})
+        log_sample(file_id, desc, {},
+                   {"begin": begin_ms, "end": end_ms, "value": active_samples})
 
     return finish_samples()
 
@@ -462,9 +526,6 @@ def count_samples_in_folded(folded_file):
 
 
 def process(output_dir):
-    t_start = time.monotonic()
-    perf_data_xz = os.path.join(output_dir, "perf.data.xz")
-
     status_file = os.path.join(output_dir, "ebpf-dpdk-status.txt")
     if os.path.exists(status_file):
         with open(status_file) as f:
@@ -476,13 +537,19 @@ def process(output_dir):
             )
             return
 
-    if not os.path.exists(perf_data_xz):
-        sys.stderr.write(
-            f"ebpf-dpdk: post-process: {perf_data_xz} not found, skipping\n"
-        )
-        return
+    script_path, script_fmt = find_perf_script(output_dir)
+    if script_path:
+        perf_script_file = decompress_perf_script(script_path, output_dir, script_fmt)
+    else:
+        perf_data_path, perf_fmt = find_perf_data(output_dir)
+        if perf_data_path is None:
+            sys.stderr.write(
+                f"ebpf-dpdk: post-process: no perf-script.txt or perf.data found, "
+                f"skipping\n"
+            )
+            return
+        perf_script_file = run_perf_script(perf_data_path, output_dir, perf_fmt)
 
-    perf_script_file = run_perf_script(perf_data_xz, output_dir)
     if perf_script_file is None:
         return
 
@@ -499,47 +566,11 @@ def process(output_dir):
         except (json.JSONDecodeError, KeyError):
             pass
 
-    timestamps = parse_timestamps_from_perf_script(perf_script_file)
-    traffic_window = detect_traffic_window(timestamps)
+    folded_full = collapse_stacks(perf_script_file, output_dir)
+    if folded_full is None:
+        return
 
-    folded_full_path = os.path.join(output_dir, "perf.folded")
-    folded_active_path = os.path.join(output_dir, "perf-active.folded")
-    active_samples = None
-
-    use_single_pass = (
-        traffic_window is not None and not os.path.exists(STACKCOLLAPSE)
-    )
-
-    if use_single_pass:
-        # Single-pass optimization: collapse full + active in one scan
-        start_ts, end_ts = traffic_window
-        total_samples, active_samples = builtin_collapse_with_time_split(
-            perf_script_file, folded_full_path,
-            folded_active_path, start_ts, end_ts
-        )
-    else:
-        # Standard path: use stackcollapse-perf.pl (or builtin) for full
-        folded_full_path = collapse_stacks(perf_script_file, output_dir)
-        if folded_full_path is None:
-            return
-        total_samples = count_samples_in_folded(folded_full_path)
-
-        if traffic_window:
-            start_ts, end_ts = traffic_window
-            active_script = os.path.join(output_dir, "perf-script-active.txt")
-            if filter_perf_script_by_time(
-                perf_script_file, active_script, start_ts, end_ts
-            ):
-                folded_active_result = collapse_stacks(active_script, output_dir)
-                if folded_active_result:
-                    os.rename(folded_active_result, folded_active_path)
-                    active_samples = count_samples_in_folded(folded_active_path)
-                if os.path.exists(active_script):
-                    os.unlink(active_script)
-
-    if os.path.exists(perf_script_file):
-        os.unlink(perf_script_file)
-
+    total_samples = count_samples_in_folded(folded_full)
     sys.stderr.write(
         f"ebpf-dpdk: post-process: total samples: {total_samples}\n"
     )
@@ -548,34 +579,58 @@ def process(output_dir):
         output_dir, f"flamegraph-{target_name}-full.svg"
     )
     generate_flamegraph(
-        folded_full_path, svg_full,
+        folded_full, svg_full,
         title=f"DPDK PMD CPU Profile ({target_name}) - Full Run"
     )
 
     folded_compressed = os.path.join(
         output_dir, f"flamegraph-{target_name}.folded.xz"
     )
-    with open(folded_full_path, "rb") as fin:
+    with open(folded_full, "rb") as fin:
         with lzma.open(folded_compressed, "wb") as fout:
             fout.write(fin.read())
     sys.stderr.write(
         f"ebpf-dpdk: post-process: saved {folded_compressed}\n"
     )
 
-    if active_samples is not None and active_samples > 0:
-        sys.stderr.write(
-            f"ebpf-dpdk: post-process: active traffic samples: "
-            f"{active_samples}\n"
-        )
-        svg_active = os.path.join(
-            output_dir, f"flamegraph-{target_name}-active.svg"
-        )
-        generate_flamegraph(
-            folded_active_path, svg_active,
-            title=f"DPDK PMD CPU Profile ({target_name}) - Active Traffic"
-        )
+    active_samples = None
+    timestamps = parse_timestamps_from_perf_script(perf_script_file)
+    traffic_window = detect_traffic_window(timestamps)
 
-    top_funcs = extract_top_functions(folded_full_path)
+    if traffic_window:
+        start_ts, end_ts = traffic_window
+
+        active_script = os.path.join(output_dir, "perf-script-active.txt")
+        if filter_perf_script_by_time(
+            perf_script_file, active_script, start_ts, end_ts
+        ):
+            folded_active = os.path.join(output_dir, "perf-active.folded")
+            folded_active = collapse_stacks(active_script, output_dir)
+            if folded_active:
+                os.rename(folded_active, os.path.join(output_dir, "perf-active.folded"))
+                folded_active = os.path.join(output_dir, "perf-active.folded")
+
+                active_samples = count_samples_in_folded(folded_active)
+                sys.stderr.write(
+                    f"ebpf-dpdk: post-process: active traffic samples: "
+                    f"{active_samples}\n"
+                )
+
+                svg_active = os.path.join(
+                    output_dir, f"flamegraph-{target_name}-active.svg"
+                )
+                generate_flamegraph(
+                    folded_active, svg_active,
+                    title=f"DPDK PMD CPU Profile ({target_name}) - Active Traffic"
+                )
+
+            if os.path.exists(active_script):
+                os.unlink(active_script)
+
+    if os.path.exists(perf_script_file):
+        os.unlink(perf_script_file)
+
+    top_funcs = extract_top_functions(folded_full)
     if top_funcs:
         sys.stderr.write("ebpf-dpdk: post-process: top functions:\n")
         for func, pct in top_funcs[:5]:
@@ -585,9 +640,8 @@ def process(output_dir):
         output_dir, top_funcs, total_samples, active_samples
     )
 
-    for tmp in [folded_full_path, folded_active_path]:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    if os.path.exists(folded_full):
+        os.unlink(folded_full)
 
     manifest = {
         "rickshaw-bench-metric": {"schema": {"version": "2021.04.12"}},
@@ -603,10 +657,7 @@ def process(output_dir):
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
-    t_end = time.monotonic()
-    sys.stderr.write(
-        f"ebpf-dpdk: post-process: complete in {t_end-t_start:.1f}s\n"
-    )
+    sys.stderr.write("ebpf-dpdk: post-process: complete\n")
 
 
 if __name__ == "__main__":
