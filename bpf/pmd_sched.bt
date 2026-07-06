@@ -21,7 +21,7 @@ tracepoint:sched:sched_switch
     $next_pid = args.next_pid;
 
     /* Record when a PMD thread is switched OUT */
-    if (args.prev_comm == "pmd-c*" || args.prev_comm == "lcore-worker*") {
+    if (strncmp(args.prev_comm, "pmd-c", 5) == 0 || strncmp(args.prev_comm, "lcore-worker", 12) == 0) {
         @off_cpu[$prev_pid] = nsecs;
     }
 
