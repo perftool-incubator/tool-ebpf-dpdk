@@ -604,11 +604,17 @@ def process(output_dir):
         if filter_perf_script_by_time(
             perf_script_file, active_script, start_ts, end_ts
         ):
-            folded_active = os.path.join(output_dir, "perf-active.folded")
+            # Rename full-run folded stacks before collapsing the active
+            # window, since collapse_stacks always writes to perf.folded
+            folded_full_saved = os.path.join(output_dir, "perf-full.folded")
+            os.rename(folded_full, folded_full_saved)
+            folded_full = folded_full_saved
+
             folded_active = collapse_stacks(active_script, output_dir)
             if folded_active:
-                os.rename(folded_active, os.path.join(output_dir, "perf-active.folded"))
-                folded_active = os.path.join(output_dir, "perf-active.folded")
+                active_folded_path = os.path.join(output_dir, "perf-active.folded")
+                os.rename(folded_active, active_folded_path)
+                folded_active = active_folded_path
 
                 active_samples = count_samples_in_folded(folded_active)
                 sys.stderr.write(

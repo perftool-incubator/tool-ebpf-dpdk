@@ -43,7 +43,6 @@ if [ -f "${DAEMON_PID_FILE}" ]; then
         if [ "${status}" == "waiting-for-pmd" ]; then
             echo "tool-ebpf-dpdk: stop: daemon still discovering, killing PID ${DAEMON_PID}"
             kill "${DAEMON_PID}" 2>/dev/null
-            wait "${DAEMON_PID}" 2>/dev/null
             echo "no-pmd-threads-found" > "${STATUS_FILE}"
         else
             echo "tool-ebpf-dpdk: stop: daemon PID ${DAEMON_PID} still alive, waiting for it to finish"

@@ -62,7 +62,7 @@ class TestExtractTopFunctions(unittest.TestCase):
             f.write("ovs-vswitchd;dp_netdev_process_rxq_port;dpcls_lookup 500\n")
             f.write("ovs-vswitchd;dp_netdev_process_rxq_port;emc_processing 300\n")
             f.write("ovs-vswitchd;dp_netdev_process_rxq_port;netdev_send 200\n")
-            f.name
+            fname = f.name
         try:
             sys.path.insert(0, os.path.dirname(os.path.dirname(
                 os.path.abspath(__file__))))
@@ -72,14 +72,14 @@ class TestExtractTopFunctions(unittest.TestCase):
                     os.path.abspath(__file__))), "ebpf-dpdk-post-process")
             ).load_module()
 
-            top = pp.extract_top_functions(f.name)
+            top = pp.extract_top_functions(fname)
             self.assertEqual(len(top), 3)
             self.assertEqual(top[0][0], "dpcls_lookup")
             self.assertAlmostEqual(top[0][1], 50.0)
             self.assertEqual(top[1][0], "emc_processing")
             self.assertAlmostEqual(top[1][1], 30.0)
         finally:
-            os.unlink(f.name)
+            os.unlink(fname)
 
 
 if __name__ == "__main__":
