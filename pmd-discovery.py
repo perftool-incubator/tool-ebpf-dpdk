@@ -289,6 +289,8 @@ def discover_all(target="auto"):
 
     if target in ("testpmd", "auto", "all"):
         testpmd_pmds = discover_dpdk_process_tids("dpdk-testpmd")
+        if not testpmd_pmds:
+            testpmd_pmds = discover_dpdk_process_tids("testpmd")
         if testpmd_pmds:
             pmds.extend(testpmd_pmds)
             sys.stderr.write(
