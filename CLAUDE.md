@@ -63,8 +63,8 @@ Metric samples must use real epoch milliseconds (not 0) to overlap with the CDM 
 - `metric_desc.names.mempool_name` — for DPDK mempool metrics (added previously)
 
 ### Metric types emitted
-- `top-function-pct` (utilization) — highest CPU% function
-- `top1-function-pct` ... `top5-function-pct` (utilization) — ranked by CPU%
+- `top-function-pct` (percentage) — highest CPU% function
+- `top1-function-pct` ... `top5-function-pct` (percentage) — ranked by CPU%
 - `perf-samples` (count) — total samples collected
 - `perf-samples-active` (count) — samples in active traffic window
 
