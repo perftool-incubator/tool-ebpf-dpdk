@@ -497,6 +497,7 @@ def emit_cdm_metrics(output_dir, top_functions, total_samples,
         "source": source_name,
         "class": "count",
         "type": "perf-samples",
+        "default-aggregation": "sum",
     }
     log_sample(file_id, desc, {},
                {"begin": begin_ms, "end": end_ms, "value": total_samples})
@@ -506,6 +507,7 @@ def emit_cdm_metrics(output_dir, top_functions, total_samples,
             "source": source_name,
             "class": "count",
             "type": "perf-samples-active",
+            "default-aggregation": "sum",
         }
         log_sample(file_id, desc, {},
                    {"begin": begin_ms, "end": end_ms, "value": active_samples})
