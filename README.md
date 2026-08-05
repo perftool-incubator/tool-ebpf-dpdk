@@ -338,8 +338,8 @@ ebpf-dpdk: discovered 10 OVS PMD thread(s) via /proc
 
 | Source | Type | Class | Description |
 |--------|------|-------|-------------|
-| `ebpf-dpdk-<id>` | `top-function-pct` | utilization | Highest CPU% function |
-| `ebpf-dpdk-<id>` | `top1-function-pct` ... `top5-function-pct` | utilization | Top 5 functions by CPU% |
+| `ebpf-dpdk-<id>` | `top-function-pct` | percentage | Highest CPU% function |
+| `ebpf-dpdk-<id>` | `top1-function-pct` ... `top5-function-pct` | percentage | Top 5 functions by CPU% |
 | `ebpf-dpdk-<id>` | `perf-samples` | count | Total perf samples collected |
 | `ebpf-dpdk-<id>` | `perf-samples-active` | count | Samples during active traffic window |
 

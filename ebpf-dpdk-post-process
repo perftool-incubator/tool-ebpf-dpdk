@@ -474,8 +474,9 @@ def emit_cdm_metrics(output_dir, top_functions, total_samples,
         top_func, top_pct = top_functions[0]
         desc = {
             "source": source_name,
-            "class": "utilization",
+            "class": "percentage",
             "type": "top-function-pct",
+            "default-aggregation": "avg",
         }
         names = {"function": top_func}
         log_sample(file_id, desc, names,
@@ -484,8 +485,9 @@ def emit_cdm_metrics(output_dir, top_functions, total_samples,
     for i, (func, pct) in enumerate(top_functions[:5]):
         desc = {
             "source": source_name,
-            "class": "utilization",
+            "class": "percentage",
             "type": f"top{i+1}-function-pct",
+            "default-aggregation": "avg",
         }
         names = {"function": func}
         log_sample(file_id, desc, names,

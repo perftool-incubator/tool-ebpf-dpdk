@@ -540,12 +540,12 @@ The tool's only code dependency is `toolbox.metrics`. Everything downstream (ric
 
 | Metric | CDM Source | CDM Class | CDM Type | Example Value |
 |--------|-----------|-----------|----------|---------------|
-| Hottest function CPU% | ebpf-dpdk | utilization | top-function-pct | 51.2 (`dpcls_lookup`) |
-| Top-1 function | ebpf-dpdk | utilization | top1-function-pct | 51.2 |
-| Top-2 function | ebpf-dpdk | utilization | top2-function-pct | 28.4 |
-| Top-3 function | ebpf-dpdk | utilization | top3-function-pct | 11.1 |
-| Top-4 function | ebpf-dpdk | utilization | top4-function-pct | 5.3 |
-| Top-5 function | ebpf-dpdk | utilization | top5-function-pct | 2.1 |
+| Hottest function CPU% | ebpf-dpdk | percentage | top-function-pct | 51.2 (`dpcls_lookup`) |
+| Top-1 function | ebpf-dpdk | percentage | top1-function-pct | 51.2 |
+| Top-2 function | ebpf-dpdk | percentage | top2-function-pct | 28.4 |
+| Top-3 function | ebpf-dpdk | percentage | top3-function-pct | 11.1 |
+| Top-4 function | ebpf-dpdk | percentage | top4-function-pct | 5.3 |
+| Top-5 function | ebpf-dpdk | percentage | top5-function-pct | 2.1 |
 | Total perf samples | ebpf-dpdk | count | perf-samples | 58212 |
 | Active-traffic samples | ebpf-dpdk | count | perf-samples-active | 45100 |
 
