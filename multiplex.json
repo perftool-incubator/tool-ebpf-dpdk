@@ -1,0 +1,40 @@
+{
+    "presets": {
+        "defaults" : [
+            { "arg": "target", "vals": ["auto"] },
+            { "arg": "frequency", "vals": ["99"] },
+            { "arg": "call-graph", "vals": ["dwarf"] },
+            { "arg": "retry-interval", "vals": ["10"] },
+            { "arg": "retry-max", "vals": ["18"] },
+            { "arg": "max-total-wait", "vals": ["180"] },
+            { "arg": "background-discovery", "vals": ["no"] }
+        ]
+    },
+    "validations": {
+        "target_name" : {
+            "description" : "target process for PMD thread discovery (auto, ovs-vswitchd, dpdk-testpmd, testpmd, generic)",
+            "args" : [ "target" ],
+            "vals": "^(auto|ovs-vswitchd|dpdk-testpmd|testpmd|generic)$"
+        },
+        "positive_integer" : {
+            "description" : "a whole number greater than 0",
+            "args" : [ "frequency", "retry-interval", "retry-max", "max-total-wait" ],
+            "vals": "^[1-9][0-9]*$"
+        },
+        "call_graph_mode" : {
+            "description" : "perf call-graph unwinding method (dwarf, fp, lbr, no)",
+            "args" : [ "call-graph" ],
+            "vals": "^(dwarf|fp|lbr|no)$"
+        },
+        "yes_no" : {
+            "description" : "yes or no",
+            "args" : [ "background-discovery" ],
+            "vals": "^(yes|no)$"
+        },
+        "generic_string" : {
+            "description" : "extra command-line options passed directly to perf record",
+            "args" : [ "perf-extra-opts" ],
+            "vals": ".+"
+        }
+    }
+}

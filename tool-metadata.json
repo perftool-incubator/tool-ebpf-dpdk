@@ -1,0 +1,35 @@
+{
+  "rickshaw-tool-metadata": {
+    "schema": {
+      "version": "2026.08.11"
+    }
+  },
+  "tool": "ebpf-dpdk",
+  "description": "eBPF and perf-based CPU profiling and flamegraph generation targeting OVS-DPDK and DPDK testpmd PMD threads. Produces flamegraph SVGs, folded stacks, and CDM metrics for top function hotspots.",
+  "cdm_indexed": true,
+  "cdm_sources": [
+    {
+      "source": "ebpf-dpdk",
+      "types": [
+        "top-function-pct",
+        "top1-function-pct",
+        "top2-function-pct",
+        "top3-function-pct",
+        "top4-function-pct",
+        "top5-function-pct",
+        "perf-samples",
+        "perf-samples-active"
+      ]
+    }
+  ],
+  "output_files": [
+    "perf-script.txt.gz",
+    "flamegraph-<target>-full.svg",
+    "flamegraph-<target>-active.svg",
+    "flamegraph-<target>.folded.xz",
+    "pmd-discovery.json",
+    "ebpf-dpdk-start-stderrout.txt",
+    "ebpf-dpdk-stop-stderrout.txt",
+    "ebpf-dpdk-status.txt"
+  ]
+}
