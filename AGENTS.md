@@ -101,6 +101,14 @@ The stop script enforces a 120s `MAX_STOP_TIME`:
 3. Compress with gzip (if >10s remaining)
 4. Fallback: compress raw perf.data if perf-script fails
 
+## Testing
+
+- Run post-processor locally: `cd <tool-data-dir> && TOOLBOX_HOME=/opt/crucible/subprojects/core/toolbox python3 /opt/crucible/subprojects/tools/ebpf-dpdk/ebpf-dpdk-post-process`
+- Test pmd-discovery: `python3 pmd-discovery.py --target ovs-vswitchd --output json`
+- Validate syntax: `python3 -c "import py_compile; py_compile.compile('ebpf-dpdk-post-process', doraise=True)"`
+- Run test suite: `TOOLBOX_HOME=/opt/crucible/subprojects/core/toolbox pytest tests/`
+- Full integration: `crucible run <run-file.json>` with ebpf-dpdk configured
+
 ## Conventions
 - Primary branch is `main`
 - Standard Bash modelines and 4-space indentation

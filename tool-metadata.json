@@ -9,7 +9,7 @@
   "cdm_indexed": true,
   "cdm_sources": [
     {
-      "source": "ebpf-dpdk",
+      "source": "ebpf-dpdk-<instance>",
       "types": [
         "top-function-pct",
         "top1-function-pct",
@@ -28,8 +28,11 @@
     "flamegraph-<target>-active.svg",
     "flamegraph-<target>.folded.xz",
     "pmd-discovery.json",
+    "ebpf-dpdk-tids.txt",
+    "ebpf-dpdk-status.txt",
+    "ebpf-dpdk-stop-signal",
     "ebpf-dpdk-start-stderrout.txt",
     "ebpf-dpdk-stop-stderrout.txt",
-    "ebpf-dpdk-status.txt"
+    "ebpf-dpdk-daemon-stderrout.txt"
   ]
 }
